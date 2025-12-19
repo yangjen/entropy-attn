@@ -127,12 +127,6 @@ base_configs = [
     for s in NUM_STAGES_OPTIONS \
     for w in [4, 8]\
 ]
-decode_configs = [
-    triton.Config({'BLOCK_M': 1, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
-    for BN in [32, 64, 128]\
-    for s in NUM_STAGES_OPTIONS \
-    for w in [4, 8]\
-]
 configs = base_configs
 if "PYTEST_VERSION" in os.environ:
     # Use a single config in testing for reproducibility
@@ -157,15 +151,6 @@ def prune_invalid_configs(configs, named_args, **kwargs):
     return [
         conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
             conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
-    ]
-
-
-def prune_invalid_decode_configs(configs, named_args, **kwargs):
-    N_Q = kwargs["N_Q"]
-    KV_N_CTX = kwargs["KV_N_CTX"]
-    return [
-        conf for conf in configs
-        if conf.kwargs.get("BLOCK_M", 0) <= N_Q and conf.kwargs.get("BLOCK_N", 0) <= KV_N_CTX
     ]
 
 
@@ -254,113 +239,6 @@ def _attn_fwd(sm_scale, M, E,  #
     tl.store(m_ptrs, m_i)
     tl.store(e_ptrs, e_i)
     desc_o.store([qo_offset_y, 0], acc.to(dtype))
-
-
-@triton.autotune(configs=list(filter(keep, decode_configs)),
-                 key=["KV_N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
-                 prune_configs_by={'early_config_prune': prune_invalid_decode_configs})
-@triton.jit
-def _attn_fwd_decode(sm_scale, M, E,  #
-                     Z, H, desc_q, desc_k, desc_v, desc_o, N_Q, KV_N_CTX,  #
-                     HEAD_DIM: tl.constexpr,  #
-                     BLOCK_M: tl.constexpr,  #
-                     BLOCK_N: tl.constexpr,  #
-                     FP8_OUTPUT: tl.constexpr,  #
-                     warp_specialize: tl.constexpr,  #
-                     IS_HOPPER: tl.constexpr,  #
-                     CAUSAL: tl.constexpr,  #
-                     ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
-    tl.static_assert(BLOCK_M == 1)
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
-    ln2 = 0.69314718056
-
-    # Position of this query in the full sequence. If N_Q == KV_N_CTX (prefill),
-    # this is just start_m. If N_Q == 1 (decode), this shifts to the last token.
-    base_pos = KV_N_CTX - N_Q
-
-    q_dim = Z * H * N_Q
-    kv_dim = Z * H * KV_N_CTX
-    desc_q = _maybe_make_tensor_desc(desc_q, shape=[q_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
-    if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, kv_dim], strides=[KV_N_CTX, 1],
-                                         block_shape=[HEAD_DIM, BLOCK_N])
-    else:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[kv_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                         block_shape=[BLOCK_N, HEAD_DIM])
-    desc_k = _maybe_make_tensor_desc(desc_k, shape=[kv_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[q_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
-
-    q_offset_y = off_z * (N_Q * H) + off_h * N_Q + start_m * BLOCK_M
-    kv_offset_y = off_z * (KV_N_CTX * H) + off_h * KV_N_CTX
-
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    e_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-    qk_scale = sm_scale * 1.44269504  # 1/log(2)
-    q = desc_q.load([q_offset_y, 0])
-
-    offsetk_y = kv_offset_y
-    offsetv_y = kv_offset_y if dtype != tl.float8e5 else kv_offset_y * HEAD_DIM
-
-    for start_n in tl.range(0, KV_N_CTX, BLOCK_N, warp_specialize=warp_specialize):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        k = desc_k.load([offsetk_y, 0]).T
-        qk = tl.dot(q, k) * qk_scale
-        if CAUSAL:
-            mask = (offs_m[:, None] + base_pos) >= (start_n + offs_n[None, :])
-            qk = tl.where(mask, qk, -1.0e6)
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk = qk - m_ij[:, None]
-        p = tl.math.exp2(qk)
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_ij = tl.sum(p, 1)
-
-        e_i = e_i * alpha + tl.sum(p * (qk + m_ij[:, None]), 1)
-
-        if not IS_HOPPER and warp_specialize and BLOCK_M == 128 and HEAD_DIM == 128:
-            BM: tl.constexpr = acc.shape[0]
-            BN: tl.constexpr = acc.shape[1]
-            acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-            acc0 = acc0 * alpha[:, None]
-            acc1 = acc1 * alpha[:, None]
-            acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
-        else:
-            acc = acc * alpha[:, None]
-
-        if dtype == tl.float8e5:
-            v = desc_v.load([0, offsetv_y]).T
-        else:
-            v = desc_v.load([offsetv_y, 0])
-        p = p.to(dtype)
-        acc = tl.dot(p, v, acc)
-
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
-        offsetk_y += BLOCK_N
-        offsetv_y += BLOCK_N
-
-    e_i = tl.math.log(l_i) + m_i * ln2 - (e_i / l_i) * ln2
-    m_i += tl.math.log2(l_i)
-    acc = acc / l_i[:, None]
-
-    m_ptrs = M + off_hz * N_Q + offs_m
-    e_ptrs = E + off_hz * N_Q + offs_m
-    tl.store(m_ptrs, m_i)
-    tl.store(e_ptrs, e_i)
-    desc_o.store([q_offset_y, 0], acc.to(dtype))
 
 
 @triton.jit
