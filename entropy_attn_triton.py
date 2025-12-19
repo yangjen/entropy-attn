@@ -622,6 +622,10 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=False, decode=False):
+
+        if q.size(2) == 1 and not decode:
+            decode = True
+
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
