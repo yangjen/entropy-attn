@@ -160,7 +160,10 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
     else:
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
+_valid = list(filter(keep, configs))
+print("[entropy_attn_triton] total configs:", len(configs), "valid after keep:", len(_valid))
 
+# @triton.autotune(configs=_valid, key=[...], prune_configs_by=None)
 @triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "DTYPE", "warp_specialize"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
@@ -194,12 +197,15 @@ def _attn_fwd(sm_scale, M, E,  #
     y_dim = Z * H * N_CTX
     desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
-    if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
-                                         block_shape=[HEAD_DIM, BLOCK_N])
-    else:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                         block_shape=[BLOCK_N, HEAD_DIM])
+    # if FP8_OUTPUT:
+    #     desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
+    #                                      block_shape=[HEAD_DIM, BLOCK_N])
+    # else:
+    #     desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    #                                      block_shape=[BLOCK_N, HEAD_DIM])
+    # NOTE: disable FP8-specific V descriptor path for now (fixes Triton type mismatch)
+    desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                     block_shape=[BLOCK_N, HEAD_DIM])
     desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_N, HEAD_DIM])
 
@@ -517,6 +523,12 @@ class _attention(torch.autograd.Function):
     def forward(ctx, q, k, v, causal, sm_scale, temp, warp_specialize=False, decode=False):
 
         if q.size(2) == 1 and not decode:
+            decode = True
+
+        if k.shape[2] != q.shape[2]:
+            decode = True
+
+        if (not decode) and (q.shape[2] < 256):
             decode = True
 
         assert len(temp.size()) == 3, f"temperature vector must be Z, H, N_CTX"
