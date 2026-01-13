@@ -1,17 +1,12 @@
-# entropy_attn_llama.py (no in use)
+#attention_llama.py
 import torch
 from dataclasses import dataclass
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
-from models.attn_patch import entropy_attention_forward  # jeff's entropy-attn wrapper
+from models.attn_patch import entropy_attention_forward  # only needed for entropy_attn
 
 def _register_entropy_attn():
-    """
-    Register 'entropy_attn' into HF attention dispatcher so config.attn_implementation='entropy_attn'
-    will route to our function.
-    """
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
     state = {"printed": False}
 
     def wrapped(*args, **kwargs):
@@ -20,60 +15,57 @@ def _register_entropy_attn():
             print("[VERIFY] entropy_attention_forward CALLED")
         return entropy_attention_forward(*args, **kwargs)
 
-    # HF has had different shapes for this across versions:
-    # - sometimes dict-like
-    # - sometimes has .register()
     if hasattr(ALL_ATTENTION_FUNCTIONS, "register"):
         ALL_ATTENTION_FUNCTIONS.register("entropy_attn", wrapped)
     else:
         ALL_ATTENTION_FUNCTIONS["entropy_attn"] = wrapped
 
-    # Print what got registered
-    try:
-        fn = ALL_ATTENTION_FUNCTIONS.get("entropy_attn", None)
-    except Exception:
-        fn = ALL_ATTENTION_FUNCTIONS["entropy_attn"]
-    print("[VERIFY] Registered ALL_ATTENTION_FUNCTIONS['entropy_attn'] ->", fn)
-
+    print("[VERIFY] Registered entropy_attn attention impl")
     return wrapped
 
+_STR2DTYPE = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp32": torch.float32,
+}
 
 @dataclass
-class EntropyAttnLlama:
+class LlamaRunner:
     model_name: str
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
-    attn_impl: str = "entropy_attn"  # <-- IMPORTANT
+    attn_impl: str = "sdpa"  # "sdpa", "flash_attention_2", "eager", "entropy_attn"
+    deterministic: bool = True
 
     def __post_init__(self):
-        # 0) Register BEFORE model is instantiated
-        _register_entropy_attn()
+        if self.deterministic:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
 
-        # 1) Tokenizer
+        if self.attn_impl == "entropy_attn":
+            _register_entropy_attn()
+
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # 2) Config: force our implementation
         config = AutoConfig.from_pretrained(self.model_name)
         config.attn_implementation = self.attn_impl
-        # keep this for older/newer compatibility
         setattr(config, "_attn_implementation", self.attn_impl)
 
-        # 3) Load model on a single GPU (predictable)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             config=config,
-            dtype=self.dtype,       
+            torch_dtype=self.dtype,   # IMPORTANT: use torch_dtype
             device_map=None,
         ).to(self.device)
 
         self.model.eval()
-
         print(
-            f"[EntropyAttnLlama] attn_impl="
+            f"[LlamaRunner] attn_impl="
             f"{getattr(self.model.config, '_attn_implementation', None)} / "
-            f"{getattr(self.model.config, 'attn_implementation', None)}"
+            f"{getattr(self.model.config, 'attn_implementation', None)}  "
+            f"dtype={next(self.model.parameters()).dtype}"
         )
 
     @torch.inference_mode()
@@ -92,22 +84,9 @@ class EntropyAttnLlama:
         )
 
         gen_ids = out[0, inputs["input_ids"].shape[-1]:]
-        text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
-
-        # if stop_on_newline:
-        #     text = text.splitlines()[0]
-        # return text.strip()
-
-        # gen_ids = out[0, inputs["input_ids"].shape[-1]:]
         if gen_ids.numel() == 0:
             return ""
-        
-        text = text.strip()
+        text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
         if stop_on_newline:
-            lines = text.splitlines()
-            text = (lines[0].strip() if lines else "")
+            text = (text.splitlines()[0].strip() if text else "")
         return text
-
-
-
-
