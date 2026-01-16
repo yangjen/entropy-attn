@@ -23,12 +23,27 @@ def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None, dtype=torch.float
 
     out = torch.einsum("bhqk,bhkd->bhqd", A, v)
 
+    sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, is_causal=True, scale=scale
+    )
     triton_out, triton_entropy = attention(q, k, v, True, scale, temp)
+
+    names = ["eager", "entropy", "sdpa"]
+    for n, o1 in zip(names, [out,  triton_out, sdpa_out]):
+        print(f"{n}\t", end="")
+        for o2 in [out, triton_out, sdpa_out]:
+            diff = (o1 - o2).abs().amax()
+            diff_mean = (o1 - o2).abs().mean()
+            print(f"{diff:.5f}  ", end="")
+        print()
+
+    print("\n\n")
 
     diff = (out - triton_out).abs()
     ent_diff = (entropy - triton_entropy).abs()
 
-    print(f"attn out diffmax: {diff.amax()=} ent diffmax: {ent_diff.amax()=}")
+    msg = f"attn out diffmax: {diff.amax()=} ent diffmax: {ent_diff.amax()=}"
+    print(msg)
     torch.testing.assert_close(out, triton_out, atol=1e-2, rtol=0)
     torch.testing.assert_close(entropy, triton_entropy, atol=1e-2, rtol=0)
 
@@ -54,6 +69,9 @@ def test_decode(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None, dtype=torch.float1
 
     triton_out, triton_entropy = attention(q, k, v, True, scale, temp)
 
+    diff = (out - triton_out).abs()
+    ent_diff = (entropy - triton_entropy).abs()
+    print(f"attn out diffmax: {diff.amax()=} ent diffmax: {ent_diff.amax()=}")
     torch.testing.assert_close(out, triton_out, atol=1e-2, rtol=0)
     torch.testing.assert_close(entropy, triton_entropy, atol=1e-2, rtol=0)
 
@@ -61,8 +79,9 @@ if __name__ == "__main__":
     for i in range(10):
         device = "cuda:0"
         dtype = torch.float16
-        Z, H, N_CTX = 4, 8, 512
-        temp = torch.rand(Z, H, N_CTX, device=device, dtype=dtype).clamp(min=0.1)
+        Z, H, N_CTX = 4, 8, 512 + 7
+        # temp = torch.rand(Z, H, N_CTX, device=device, dtype=dtype).clamp(min=0.1)
+        temp = torch.ones(Z, H, N_CTX, device=device, dtype=dtype).clamp(min=0.1)
         test_prefill(Z=Z, H=H, N_CTX=N_CTX, temp=temp, dtype=dtype)
         test_decode(Z=Z, H=H, N_CTX=N_CTX, temp=temp[:, :, :1], dtype=dtype)
 
