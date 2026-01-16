@@ -1,20 +1,5 @@
-# run_ruler_eval.py
-"""
-# baseline SDPA
-CUDA_VISIBLE_DEVICES=0 python run_ruler_eval.py \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
-  --tasks qa_2 \
-  --max_new_tokens 64 \
-  --compact \
-  --use_judge \
-  --judge_on_all_non_em \
-  --log_every 10 \
-  --attn_impl sdpa \
-  --dtype bf16 \
-  --deterministic
-
-CUDA_VISIBLE_DEVICES=1 python run_ruler_eval.py \
+'''
+CUDA_VISIBLE_DEVICES=1 python run_ruler_eval_timed.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
   --tasks qa_1 \
@@ -22,50 +7,30 @@ CUDA_VISIBLE_DEVICES=1 python run_ruler_eval.py \
   --compact \
   --log_every 10 \
   --eval_mode ruler_part \
-  --attn_impl sdpa \
-  --dtype bf16 \
-  --deterministic
-
-# baseline FlashAttention2 (if supported/installed)
-CUDA_VISIBLE_DEVICES=2 python run_ruler_eval.py \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
-  --tasks qa_2 \
-  --max_new_tokens 64 \
-  --compact \
-  --use_judge \
-  --judge_on_all_non_em \
-  --log_every 10 \
   --attn_impl flash_attention_2 \
   --dtype bf16 \
-  --deterministic
+  --deterministic \
+  --time \
+  --time_skip 4
 
-# custom entropy kernel
-CUDA_VISIBLE_DEVICES=0 python run_ruler_eval.py \
+
+  CUDA_VISIBLE_DEVICES=4 python run_ruler_eval_timed.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
   --tasks qa_2 \
-  --max_new_tokens 64 \
-  --compact \
-  --use_judge \
-  --judge_on_all_non_em \
-  --log_every 10 \
-  --attn_impl entropy_attn \
-  --dtype bf16 \
-  --deterministic
-
-CUDA_VISIBLE_DEVICES=3 python run_ruler_eval.py \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
-  --tasks qa_1 \
   --max_new_tokens 64 \
   --compact \
   --log_every 10 \
   --eval_mode ruler_part \
   --attn_impl entropy_attn \
   --dtype bf16 \
-  --deterministic
-"""
+  --deterministic \
+  --time \
+  --time_skip 4
+
+
+'''
+
 
 import os
 import json
@@ -80,6 +45,43 @@ from attention_llama import LlamaRunner
 
 def fmt_ratio(k: int, n: int) -> str:
     return f"{k}/{n} ({(k / max(n, 1)) * 100:.1f}%)"
+
+def _summarize_times(times: List[float]) -> Dict[str, float]:
+    """Summarize a list of durations in seconds."""
+    if not times:
+        return {"n": 0}
+    ts = sorted(times)
+    n = len(ts)
+    def pct(p: float) -> float:
+        if n == 1:
+            return ts[0]
+        k = int(round((p/100.0) * (n - 1)))
+        k = max(0, min(n - 1, k))
+        return ts[k]
+    return {
+        "n": n,
+        "mean_s": sum(ts) / n,
+        "median_s": pct(50),
+        "p90_s": pct(90),
+        "p95_s": pct(95),
+        "min_s": ts[0],
+        "max_s": ts[-1],
+    }
+
+def _cuda_time_call(fn, enabled: bool, state: Dict[str, int], skip: int, times: List[float]):
+    """Time a single CUDA call with cuda.Events. Skips the first `skip` calls globally per-state."""
+    if not enabled or (not torch.cuda.is_available()):
+        return fn()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    out = fn()
+    end_event.record()
+    torch.cuda.synchronize()
+    state["n"] = state.get("n", 0) + 1
+    if state["n"] > skip:
+        times.append(start_event.elapsed_time(end_event) / 1000.0)  # seconds
+    return out
 
 
 _PUNCT_TABLE = str.maketrans("", "", string.punctuation)
@@ -259,7 +261,7 @@ def main():
     ap.add_argument("--tasks", default="ALL")
     ap.add_argument("--max_new_tokens", type=int, default=64)
     ap.add_argument("--multiline", action="store_true")
-    ap.add_argument("--pred_name", default="predictions.jsonl")
+    ap.add_argument("--pred_name", default="predictions_timed.jsonl")
     ap.add_argument("--compact", action="store_true")
     ap.add_argument("--log_every", type=int, default=10)
 
@@ -282,6 +284,8 @@ def main():
     )
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--deterministic", action="store_true")
+    ap.add_argument("--time", action="store_true", help="Measure CUDA time for generation calls (pred and judge)")
+    ap.add_argument("--time_skip", type=int, default=4, help="Skip first N timed calls per stream (warmup/autotune)")
 
     args = ap.parse_args()
 
@@ -307,6 +311,12 @@ def main():
     )
 
     summary: Dict[str, Any] = {}
+    # Optional CUDA timing
+    pred_times_s: List[float] = []
+    judge_times_s: List[float] = []
+    pred_time_state: Dict[str, int] = {'n': 0}
+    judge_time_state: Dict[str, int] = {'n': 0}
+
 
     for task in tasks:
         task_dir = os.path.join(args.data_root, task)
@@ -335,10 +345,13 @@ def main():
                 if answer_prefix and not prompt.endswith(answer_prefix):
                     prompt = prompt + answer_prefix
 
-                pred = runner.generate_one(
-                    prompt,
-                    max_new_tokens=args.max_new_tokens,
-                    stop_on_newline=(not args.multiline),
+                pred = _cuda_time_call(
+                    lambda: runner.generate_one(
+                        prompt,
+                        max_new_tokens=args.max_new_tokens,
+                        stop_on_newline=(not args.multiline),
+                    ),
+                    enabled=args.time, state=pred_time_state, skip=args.time_skip, times=pred_times_s,
                 )
                 golds = ex.get("outputs", [])
 
@@ -391,10 +404,13 @@ def main():
                 if needs_judge:
                     judge_calls += 1
                     jprompt = make_judge_prompt(question_block=prompt, golds=list(golds), pred=pred)
-                    jout = runner.generate_one(
-                        jprompt,
-                        max_new_tokens=args.judge_max_new_tokens,
-                        stop_on_newline=True,
+                    jout = _cuda_time_call(
+                        lambda: runner.generate_one(
+                            jprompt,
+                            max_new_tokens=args.judge_max_new_tokens,
+                            stop_on_newline=True,
+                        ),
+                        enabled=args.time, state=judge_time_state, skip=args.time_skip, times=judge_times_s,
                     )
                     judge_ok = parse_judge_output(jout)
                     if judge_ok is None:
@@ -476,8 +492,22 @@ def main():
     def _safe_name(s: str) -> str:
         return "".join(c if (c.isalnum() or c in "._-") else "_" for c in s)
 
+    # Timing report (CUDA events) for generate calls
+    if args.time and torch.cuda.is_available():
+        t_pred = _summarize_times(pred_times_s)
+        t_judge = _summarize_times(judge_times_s)
+        print("\n[TIMING] pred_generate:", t_pred)
+        print("[TIMING] judge_generate:", t_judge)
+        summary["_timing"] = {
+            "pred_generate": t_pred,
+            "judge_generate": t_judge,
+            "time_skip": args.time_skip,
+            "attn_impl": args.attn_impl,
+            "dtype": args.dtype,
+        }
+
     tasks_tag = _safe_name(args.tasks)
-    summ_path = os.path.join(args.data_root, f"summary_{tasks_tag}_{args.attn_impl}.json")
+    summ_path = os.path.join(args.data_root, f"summary_{tasks_tag}_{args.attn_impl}_timed.json")
     # summ_path = os.path.join(args.data_root, f"summary_{tasks_tag}_{args.attn_impl}_{args.dtype}.json")
 
     with open(summ_path, "w", encoding="utf-8") as f:
